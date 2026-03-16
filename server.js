@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-//  LifeAI Backend — Node.js + Express + Claude API
+//  LifeAI Backend — Node.js + Express + Google Gemini API
 //  Deploy to Render (free tier) at render.com
 //  ─────────────────────────────────────────────────────────────
 //  ENDPOINTS:
@@ -7,34 +7,32 @@
 //    POST /draft-email     → AI email draft
 //    POST /finance-summary → AI expense analysis
 //    POST /chat            → General AI conversation
-//    POST /appointments    → Store appointments (+ Google Cal stub)
+//    POST /appointments    → Store appointments
 //    GET  /health-check    → Server status ping
 // ═══════════════════════════════════════════════════════════════
 
-const express  = require('express');
-const cors     = require('cors');
-const Anthropic = require('@anthropic-ai/sdk').default;
+const express = require('express');
+const cors    = require('cors');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
 // ─────────────────────────────────────────
-//  ANTHROPIC CLIENT
-//  Set ANTHROPIC_API_KEY in your Render env vars
+//  GEMINI API CONFIG
+//  Set GEMINI_API_KEY in your Render env vars
+//  Get your free key at: aistudio.google.com/app/apikey
 // ─────────────────────────────────────────
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY, // never hard-code this
-});
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_URL     = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
 // ─────────────────────────────────────────
-//  IN-MEMORY DATABASE (for demo/testing)
-//  In production: swap for PostgreSQL / MongoDB
+//  IN-MEMORY DATABASE
 // ─────────────────────────────────────────
 const db = {
   appointments: [],
   expenses:     [],
   tasks:        [],
-  chatSessions: {},  // sessionId → message array
+  chatSessions: {},
 };
 
 // ─────────────────────────────────────────
@@ -46,269 +44,232 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-app.use(express.json({ limit: '2mb' }));  // parse JSON bodies
+app.use(express.json({ limit: '2mb' }));
 
-// Simple request logger
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
 });
 
 // ─────────────────────────────────────────
-//  HELPER — call Claude API
-//  Wraps the Anthropic SDK in a clean function
+//  HELPER — call Gemini API
 // ─────────────────────────────────────────
-async function askClaude({ systemPrompt, userMessage, maxTokens = 800 }) {
-  const message = await anthropic.messages.create({
-    model:      'claude-sonnet-4-20250514',   // fast + capable model
-    max_tokens: maxTokens,
-    system:     systemPrompt,
-    messages: [
-      { role: 'user', content: userMessage }
-    ],
+async function askGemini(systemPrompt, userMessage) {
+  const response = await fetch(GEMINI_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            { text: systemPrompt + '\n\n' + userMessage }
+          ]
+        }
+      ],
+      generationConfig: {
+        temperature:     0.7,
+        maxOutputTokens: 800,
+      }
+    })
   });
 
-  // The response content is an array; extract the first text block
-  const textBlock = message.content.find(b => b.type === 'text');
-  return textBlock ? textBlock.text : '';
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Gemini API error: ${response.status} — ${err}`);
+  }
+
+  const data = await response.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 
 // ─────────────────────────────────────────
-//  HELPER — call Claude with conversation history
+//  HELPER — call Gemini with chat history
 // ─────────────────────────────────────────
-async function askClaudeWithHistory({ systemPrompt, messages, maxTokens = 600 }) {
-  const response = await anthropic.messages.create({
-    model:      'claude-sonnet-4-20250514',
-    max_tokens: maxTokens,
-    system:     systemPrompt,
-    messages,    // array of { role, content } objects
+async function askGeminiWithHistory(systemPrompt, history, newMessage) {
+  // Convert history to Gemini format
+  const contents = [];
+
+  // Add history turns
+  history.forEach(h => {
+    contents.push({
+      role: h.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: h.content }]
+    });
   });
-  const textBlock = response.content.find(b => b.type === 'text');
-  return textBlock ? textBlock.text : '';
+
+  // Add new message
+  contents.push({
+    role: 'user',
+    parts: [{ text: newMessage }]
+  });
+
+  const response = await fetch(GEMINI_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: systemPrompt }] },
+      contents,
+      generationConfig: {
+        temperature:     0.7,
+        maxOutputTokens: 600,
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Gemini API error: ${response.status} — ${err}`);
+  }
+
+  const data = await response.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  ROUTE: GET /health-check
-//  Simple ping to verify the server is alive
+//  GET /health-check
 // ═══════════════════════════════════════════════════════════════
 app.get('/health-check', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status:    'ok',
+    ai:        'Google Gemini 1.5 Flash',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════
-//  ROUTE: POST /plan-day
-//  Takes tasks + appointments, returns an AI-generated daily plan
-//
-//  Request body:
-//    { tasks: [{ name, priority }], appointments: [{ title, datetime }] }
-//
-//  Response:
-//    { plan: "..." }
+//  POST /plan-day
 // ═══════════════════════════════════════════════════════════════
 app.post('/plan-day', async (req, res) => {
   try {
     const { tasks = [], appointments = [] } = req.body;
 
-    // Build a structured prompt from the user's data
     const taskList = tasks.length
       ? tasks.map(t => `  • [${t.priority.toUpperCase()}] ${t.name}`).join('\n')
       : '  • No pending tasks';
 
     const aptList = appointments.length
       ? appointments.map(a => {
-          const dt = new Date(a.datetime);
-          const time = dt.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit' });
-          const date = dt.toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short' });
-          return `  • ${a.title} at ${time} (${date})`;
+          const dt   = new Date(a.datetime);
+          const time = dt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+          return `  • ${a.title} at ${time}`;
         }).join('\n')
       : '  • No fixed appointments today';
 
-    const systemPrompt = `You are LifeAI, a warm, organised, and encouraging personal assistant. 
-You help users plan their day in a realistic, time-blocked way. 
-Keep plans friendly, practical, and concise. Use short paragraphs and bullet time-blocks.
-Format: "HH:MM — Activity" style, with a brief motivational note at the end.
-Keep response under 250 words.`;
+    const system = `You are LifeAI, a warm and encouraging personal assistant.
+Create realistic, time-blocked daily plans. Format each block as "HH:MM — Activity".
+Be friendly and concise. End with a short motivational note. Max 250 words.`;
 
-    const userMessage = `Please create an optimised daily schedule for me. Here's my data:
+    const prompt = `Create an optimised daily schedule for me.
 
 PENDING TASKS:
 ${taskList}
 
-TODAY'S FIXED APPOINTMENTS:
+TODAY'S APPOINTMENTS:
 ${aptList}
 
-Today's date: ${new Date().toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long' })}
+Today: ${new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })}
 
-Create a realistic, time-blocked schedule starting from 8:00 AM. 
-Prioritise high-priority tasks in peak morning hours. 
-Include short breaks and don't overload the day.`;
+Start from 8:00 AM. Prioritise high-priority tasks in the morning. Include short breaks.`;
 
-    const plan = await askClaude({ systemPrompt, userMessage, maxTokens: 500 });
-
-    // Save to in-memory db (optional)
-    db.tasks = tasks;
-
+    const plan = await askGemini(system, prompt);
     res.json({ plan });
 
   } catch (err) {
-    console.error('[/plan-day] Error:', err.message);
+    console.error('[/plan-day]', err.message);
     res.status(500).json({ error: 'Failed to generate plan', details: err.message });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-//  ROUTE: POST /draft-email
-//  Takes email intent/key-points, returns a polished AI draft
-//
-//  Request body:
-//    { to, subject, points, tone? }
-//
-//  Response:
-//    { draft: "..." }
+//  POST /draft-email
 // ═══════════════════════════════════════════════════════════════
 app.post('/draft-email', async (req, res) => {
   try {
     const { to = '', subject = '', points, tone = 'professional' } = req.body;
 
-    if (!points) {
-      return res.status(400).json({ error: 'Please provide key points for the email' });
-    }
+    if (!points) return res.status(400).json({ error: 'Key points are required' });
 
-    const systemPrompt = `You are an expert email writer. You write ${tone}, clear, and concise emails.
-Always include: a proper greeting, well-structured body, and a polite sign-off.
-Keep emails under 200 words unless the content requires more.
-Do NOT include placeholders like [Your Name] — use "[Your Name]" only at the very end.
-Output ONLY the email text — no explanations or meta-commentary.`;
+    const system = `You are an expert email writer. Write ${tone}, clear, concise emails.
+Include a proper greeting, structured body, and polite sign-off.
+Output ONLY the email text. Start with "Subject: ..." on the first line.`;
 
-    const userMessage = `Draft an email with these details:
+    const prompt = `Write an email:
 To: ${to || 'the recipient'}
-Subject: ${subject || '(please suggest an appropriate subject)'}
-Key points to include: ${points}
-Tone: ${tone}
+Subject: ${subject || 'suggest an appropriate subject'}
+Key points: ${points}
+Tone: ${tone}`;
 
-Write the complete email, starting with "Subject: ..." on the first line.`;
-
-    const draft = await askClaude({ systemPrompt, userMessage, maxTokens: 600 });
-
+    const draft = await askGemini(system, prompt);
     res.json({ draft });
 
   } catch (err) {
-    console.error('[/draft-email] Error:', err.message);
+    console.error('[/draft-email]', err.message);
     res.status(500).json({ error: 'Failed to draft email', details: err.message });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-//  ROUTE: POST /finance-summary
-//  Takes an array of expense objects, returns AI analysis
-//
-//  Request body:
-//    { expenses: [{ desc, amount, category, date? }] }
-//
-//  Response:
-//    { summary: "..." }
+//  POST /finance-summary
 // ═══════════════════════════════════════════════════════════════
 app.post('/finance-summary', async (req, res) => {
   try {
     const { expenses = [] } = req.body;
+    if (!expenses.length) return res.status(400).json({ error: 'No expense data' });
 
-    if (!expenses.length) {
-      return res.status(400).json({ error: 'No expense data provided' });
-    }
-
-    // Aggregate data before sending to Claude (saves tokens)
-    const total = expenses.reduce((s, e) => s + parseFloat(e.amount || 0), 0);
+    const total      = expenses.reduce((s, e) => s + parseFloat(e.amount || e.amt || 0), 0);
     const byCategory = expenses.reduce((acc, e) => {
-      acc[e.category] = (acc[e.category] || 0) + parseFloat(e.amount || 0);
+      const cat = e.category || e.cat || 'Other';
+      acc[cat]  = (acc[cat] || 0) + parseFloat(e.amount || e.amt || 0);
       return acc;
     }, {});
-    const categoryBreakdown = Object.entries(byCategory)
+
+    const breakdown = Object.entries(byCategory)
       .sort((a, b) => b[1] - a[1])
       .map(([cat, amt]) => `  • ${cat}: £${amt.toFixed(2)}`)
       .join('\n');
 
-    const recentItems = expenses
-      .slice(-5)
-      .map(e => `  • ${e.desc} — £${parseFloat(e.amount).toFixed(2)} (${e.category})`)
-      .join('\n');
+    const system = `You are a friendly financial advisor. Analyse expenses and give actionable insights.
+Be encouraging, not judgmental. Use £ for currency. Max 200 words. Use emojis sparingly.`;
 
-    const systemPrompt = `You are LifeAI's financial advisor module. 
-You analyse personal expense data and provide friendly, actionable insights.
-Be encouraging, not judgmental. Give 2-3 specific, practical tips.
-Use £ for currency. Keep response under 200 words.
-Use emojis sparingly but effectively.`;
+    const prompt = `Analyse my spending:
 
-    const userMessage = `Analyse my expenses and give me a helpful summary:
+Total: £${total.toFixed(2)}
 
-Total logged: £${total.toFixed(2)}
+By category:
+${breakdown}
 
-Breakdown by category:
-${categoryBreakdown}
+Give: 1) brief assessment 2) biggest spending area insight 3) two practical saving tips.`;
 
-Recent transactions:
-${recentItems}
-
-Please provide:
-1. A brief overall assessment
-2. The biggest spending area and whether it seems reasonable
-3. 2 specific money-saving tips based on this data`;
-
-    const summary = await askClaude({ systemPrompt, userMessage, maxTokens: 400 });
-
-    // Persist to in-memory db
-    db.expenses = expenses;
-
+    const summary = await askGemini(system, prompt);
     res.json({ summary, total: total.toFixed(2), byCategory });
 
   } catch (err) {
-    console.error('[/finance-summary] Error:', err.message);
+    console.error('[/finance-summary]', err.message);
     res.status(500).json({ error: 'Failed to generate summary', details: err.message });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-//  ROUTE: POST /chat
-//  General AI conversation with memory of recent history
-//
-//  Request body:
-//    { message: string, history?: [{ role, content }], sessionId?: string }
-//
-//  Response:
-//    { reply: "..." }
+//  POST /chat
 // ═══════════════════════════════════════════════════════════════
 app.post('/chat', async (req, res) => {
   try {
     const { message, history = [], sessionId = 'default' } = req.body;
+    if (!message) return res.status(400).json({ error: 'Message is required' });
 
-    if (!message) {
-      return res.status(400).json({ error: 'Message is required' });
-    }
+    const system = `You are LifeAI — a warm, knowledgeable personal life assistant.
+You help with: day planning, tasks, emails, finances, health, and appointments.
+Be friendly, concise, and proactive. Use light emojis occasionally.
+Keep responses under 180 words unless more detail is asked for.`;
 
-    const systemPrompt = `You are LifeAI — a warm, knowledgeable, and proactive personal life assistant.
-You help with: day planning, task management, email drafting, financial advice, health reminders, and calendar management.
-Personality traits:
-  - Friendly and encouraging, never robotic
-  - Concise but thorough — don't over-explain
-  - Proactive: offer follow-up suggestions when helpful
-  - Use light emojis occasionally to keep the tone warm
-  - If asked to do something you'd normally route to an endpoint (plan day, draft email, etc.), do it inline in chat
-Keep responses under 180 words unless the user asks for something detailed.`;
+    const reply = await askGeminiWithHistory(system, history, message);
 
-    // Build the messages array including history for context
-    const messages = [
-      ...history.map(h => ({ role: h.role, content: h.content })),
-      { role: 'user', content: message }
-    ];
-
-    const reply = await askClaudeWithHistory({ systemPrompt, messages, maxTokens: 500 });
-
-    // Persist session history server-side (optional, helps with longer sessions)
+    // Store session
     if (!db.chatSessions[sessionId]) db.chatSessions[sessionId] = [];
     db.chatSessions[sessionId].push(
-      { role: 'user', content: message },
-      { role: 'assistant', content: reply }
+      { role: 'user',      content: message },
+      { role: 'assistant', content: reply   }
     );
-    // Keep only last 20 exchanges per session
     if (db.chatSessions[sessionId].length > 40) {
       db.chatSessions[sessionId] = db.chatSessions[sessionId].slice(-40);
     }
@@ -316,128 +277,47 @@ Keep responses under 180 words unless the user asks for something detailed.`;
     res.json({ reply });
 
   } catch (err) {
-    console.error('[/chat] Error:', err.message);
+    console.error('[/chat]', err.message);
     res.status(500).json({ error: 'Chat failed', details: err.message });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-//  ROUTE: POST /appointments
-//  Store an appointment and (stub) sync to Google Calendar
-//
-//  Request body:
-//    { title, datetime, location, notes }
-//
-//  Response:
-//    { success: true, appointment: {...}, calendarUrl?: string }
+//  POST /appointments
 // ═══════════════════════════════════════════════════════════════
 app.post('/appointments', async (req, res) => {
   try {
     const { title, datetime, location = '', notes = '' } = req.body;
+    if (!title || !datetime) return res.status(400).json({ error: 'title and datetime required' });
 
-    if (!title || !datetime) {
-      return res.status(400).json({ error: 'title and datetime are required' });
-    }
-
-    const appointment = {
-      id:        Date.now(),
-      title,
-      datetime,
-      location,
-      notes,
-      createdAt: new Date().toISOString(),
-    };
-
+    const appointment = { id: Date.now(), title, datetime, location, notes, createdAt: new Date().toISOString() };
     db.appointments.push(appointment);
-
-    // ─ Google Calendar integration stub ─
-    // To enable: implement OAuth2 flow using googleapis npm package
-    // Steps:
-    //   1. npm install googleapis
-    //   2. Create OAuth2 client with your Google Cloud credentials
-    //   3. Exchange code for tokens, store in db.googleTokens
-    //   4. Use calendar.events.insert() to create the event
-    //
-    // Example (requires auth setup):
-    // const { google } = require('googleapis');
-    // const calendar = google.calendar({ version: 'v3', auth: oauthClient });
-    // await calendar.events.insert({
-    //   calendarId: 'primary',
-    //   resource: {
-    //     summary: title,
-    //     location,
-    //     description: notes,
-    //     start: { dateTime: new Date(datetime).toISOString() },
-    //     end:   { dateTime: new Date(new Date(datetime).getTime() + 60*60*1000).toISOString() },
-    //   }
-    // });
-
-    res.json({
-      success:     true,
-      appointment,
-      message:     'Appointment saved. Connect Google OAuth to enable Calendar sync.',
-    });
+    res.json({ success: true, appointment });
 
   } catch (err) {
-    console.error('[/appointments] Error:', err.message);
+    console.error('[/appointments]', err.message);
     res.status(500).json({ error: 'Failed to save appointment', details: err.message });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-//  ROUTE: GET /appointments
-//  Retrieve all stored appointments
-// ═══════════════════════════════════════════════════════════════
 app.get('/appointments', (_req, res) => {
   res.json({ appointments: db.appointments });
 });
 
-// ═══════════════════════════════════════════════════════════════
-//  ROUTE: POST /health-reminder
-//  Generate a personalised health reminder message from Claude
-// ═══════════════════════════════════════════════════════════════
-app.post('/health-reminder', async (req, res) => {
-  try {
-    const { metrics = {}, reminderType = 'general' } = req.body;
-    // metrics example: { steps: 6240, water: 1.4, sleep: 6.5, weight: 75 }
-
-    const systemPrompt = `You are a caring, motivating health coach embedded in LifeAI.
-Generate short, friendly, personalised health reminders.
-Be positive and specific, not generic. Under 80 words.`;
-
-    const userMessage = `Generate a health reminder for type: "${reminderType}".
-User's current metrics: ${JSON.stringify(metrics)}
-Make it personal to their actual numbers if provided.`;
-
-    const reminder = await askClaude({ systemPrompt, userMessage, maxTokens: 150 });
-    res.json({ reminder });
-
-  } catch (err) {
-    console.error('[/health-reminder] Error:', err.message);
-    res.status(500).json({ error: 'Failed to generate reminder', details: err.message });
-  }
-});
-
 // ─────────────────────────────────────────
-//  404 handler
+//  404 + Error handlers
 // ─────────────────────────────────────────
-app.use((_req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
-});
-
-// ─────────────────────────────────────────
-//  GLOBAL ERROR HANDLER
-// ─────────────────────────────────────────
+app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 app.use((err, _req, res, _next) => {
-  console.error('[Global Error]', err.stack);
+  console.error('[Error]', err.stack);
   res.status(500).json({ error: 'Internal server error' });
 });
 
 // ─────────────────────────────────────────
-//  START SERVER
+//  START
 // ─────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🟢 LifeAI Backend running on port ${PORT}`);
-  console.log(`   Health check: http://localhost:${PORT}/health-check`);
-  console.log(`   Claude API key: ${process.env.ANTHROPIC_API_KEY ? '✓ Set' : '✗ NOT SET — set ANTHROPIC_API_KEY env var!'}`);
+  console.log(`   AI: Google Gemini 1.5 Flash`);
+  console.log(`   Gemini API key: ${GEMINI_API_KEY ? '✓ Set' : '✗ NOT SET — add GEMINI_API_KEY env var!'}`);
 });
