@@ -41,12 +41,7 @@ const db = {
 //  MIDDLEWARE
 // ─────────────────────────────────────────
 app.use(cors({
-  origin: [
-    'https://your-site.netlify.app', // ← replace with your Netlify URL
-    'http://localhost:3000',          // local dev
-    'http://127.0.0.1:5500',          // VS Code Live Server
-    '*',                              // allow all during development — restrict in production!
-  ],
+  origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
