@@ -16,6 +16,7 @@ const GROQ_API_KEY       = process.env.GROQ_API_KEY;
 const GMAIL_CLIENT_ID    = process.env.GMAIL_CLIENT_ID;
 const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
 const REDIRECT_URI       = 'https://backed-1-837p.onrender.com/auth/gmail/callback';
+const FIT_REDIRECT_URI   = 'https://backed-1-837p.onrender.com/auth/fit/callback';
 
 const GROQ_URL   = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
@@ -28,7 +29,8 @@ const db = {
   expenses:     [],
   tasks:        [],
   chatSessions: {},
-  gmailTokens:  {}, // uid → { access_token, refresh_token }
+  gmailTokens:  {},
+  fitTokens:    {}, // uid → { access_token, refresh_token }
 };
 
 // ─────────────────────────────────────────
@@ -280,8 +282,114 @@ app.post('/gmail/mark-read', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-//  EXISTING ROUTES (unchanged)
+//  GOOGLE FIT ROUTES
 // ═══════════════════════════════════════════════════════════════
+
+app.get('/auth/fit', (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'uid required' });
+
+  const oauth2Client = new google.auth.OAuth2(
+    GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, FIT_REDIRECT_URI
+  );
+
+  const url = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: [
+      'https://www.googleapis.com/auth/fitness.activity.read',
+      'https://www.googleapis.com/auth/fitness.body.read',
+    ],
+    state: uid,
+    prompt: 'consent',
+  });
+
+  res.json({ url });
+});
+
+app.get('/auth/fit/callback', async (req, res) => {
+  const { code, state: uid } = req.query;
+  if (!code || !uid) return res.status(400).send('Missing code or uid');
+
+  try {
+    const oauth2Client = new google.auth.OAuth2(
+      GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, FIT_REDIRECT_URI
+    );
+    const { tokens } = await oauth2Client.getToken(code);
+    db.fitTokens[uid] = tokens;
+    console.log(`Google Fit connected for uid: ${uid}`);
+    res.send(`
+      <html><body>
+        <script>
+          window.opener && window.opener.postMessage('fit-connected', '*');
+          window.close();
+        </script>
+        <p>Google Fit connected! You can close this window.</p>
+      </body></html>
+    `);
+  } catch (err) {
+    console.error('[/auth/fit/callback]', err.message);
+    res.status(500).send('Authentication failed: ' + err.message);
+  }
+});
+
+app.get('/auth/fit/status', (req, res) => {
+  const { uid } = req.query;
+  res.json({ connected: !!(uid && db.fitTokens[uid]) });
+});
+
+// GET /fit/steps?uid=xxx — fetch today's steps from Google Fit
+app.get('/fit/steps', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid || !db.fitTokens[uid]) {
+    return res.status(401).json({ error: 'Google Fit not connected' });
+  }
+
+  try {
+    const oauth2Client = new google.auth.OAuth2(
+      GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, FIT_REDIRECT_URI
+    );
+    oauth2Client.setCredentials(db.fitTokens[uid]);
+
+    const fitness = google.fitness({ version: 'v1', auth: oauth2Client });
+
+    // Get today's start and end in milliseconds
+    const now = Date.now();
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const response = await fitness.users.dataset.aggregate({
+      userId: 'me',
+      requestBody: {
+        aggregateBy: [{
+          dataTypeName: 'com.google.step_count.delta',
+          dataSourceId: 'derived:com.google.step_count.delta:com.google.android.gms:estimated_steps'
+        }],
+        bucketByTime: { durationMillis: 86400000 },
+        startTimeMillis: startOfDay.getTime(),
+        endTimeMillis: now,
+      }
+    });
+
+    let steps = 0;
+    const buckets = response.data.bucket || [];
+    buckets.forEach(bucket => {
+      const datasets = bucket.dataset || [];
+      datasets.forEach(dataset => {
+        const points = dataset.point || [];
+        points.forEach(point => {
+          const values = point.value || [];
+          values.forEach(v => { steps += v.intVal || 0; });
+        });
+      });
+    });
+
+    db.fitTokens[uid] = oauth2Client.credentials;
+    res.json({ steps });
+  } catch (err) {
+    console.error('[/fit/steps]', err.message);
+    res.status(500).json({ error: 'Failed to fetch steps', details: err.message });
+  }
+});
 
 app.get('/health-check', (_req, res) => {
   res.json({
