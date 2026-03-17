@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-//  LifeAI Backend — Node.js + Express + Google Gemini API
+//  LifeAI Backend — Node.js + Express + Groq API (Free)
 //  Deploy to Render (free tier) at render.com
 //  ─────────────────────────────────────────────────────────────
 //  ENDPOINTS:
@@ -18,12 +18,13 @@ const app  = express();
 const PORT = process.env.PORT || 3001;
 
 // ─────────────────────────────────────────
-//  GEMINI API CONFIG
-//  Set GEMINI_API_KEY in your Render env vars
-//  Get your free key at: aistudio.google.com/app/apikey
+//  GROQ API CONFIG
+//  Set GROQ_API_KEY in your Render env vars
+//  Get your free key at: console.groq.com
 // ─────────────────────────────────────────
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_URL     = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_URL     = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL   = 'llama3-70b-8192'; // fast, free, very capable
 
 // ─────────────────────────────────────────
 //  IN-MEMORY DATABASE
@@ -52,77 +53,70 @@ app.use((req, _res, next) => {
 });
 
 // ─────────────────────────────────────────
-//  HELPER — call Gemini API
+//  HELPER — call Groq API
+//  Groq uses the OpenAI-compatible format
 // ─────────────────────────────────────────
-async function askGemini(systemPrompt, userMessage) {
-  const response = await fetch(GEMINI_URL, {
+async function askGroq(systemPrompt, userMessage) {
+  const response = await fetch(GROQ_URL, {
     method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${GROQ_API_KEY}`,
+    },
     body: JSON.stringify({
-      contents: [
-        {
-          parts: [
-            { text: systemPrompt + '\n\n' + userMessage }
-          ]
-        }
+      model:       GROQ_MODEL,
+      max_tokens:  800,
+      temperature: 0.7,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userMessage  },
       ],
-      generationConfig: {
-        temperature:     0.7,
-        maxOutputTokens: 800,
-      }
-    })
+    }),
   });
 
   if (!response.ok) {
     const err = await response.text();
-    throw new Error(`Gemini API error: ${response.status} — ${err}`);
+    throw new Error(`Groq API error: ${response.status} — ${err}`);
   }
 
   const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return data.choices?.[0]?.message?.content || '';
 }
 
 // ─────────────────────────────────────────
-//  HELPER — call Gemini with chat history
+//  HELPER — call Groq with chat history
 // ─────────────────────────────────────────
-async function askGeminiWithHistory(systemPrompt, history, newMessage) {
-  // Convert history to Gemini format
-  const contents = [];
+async function askGroqWithHistory(systemPrompt, history, newMessage) {
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history.map(h => ({
+      role:    h.role === 'assistant' ? 'assistant' : 'user',
+      content: h.content,
+    })),
+    { role: 'user', content: newMessage },
+  ];
 
-  // Add history turns
-  history.forEach(h => {
-    contents.push({
-      role: h.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: h.content }]
-    });
-  });
-
-  // Add new message
-  contents.push({
-    role: 'user',
-    parts: [{ text: newMessage }]
-  });
-
-  const response = await fetch(GEMINI_URL, {
+  const response = await fetch(GROQ_URL, {
     method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${GROQ_API_KEY}`,
+    },
     body: JSON.stringify({
-      system_instruction: { parts: [{ text: systemPrompt }] },
-      contents,
-      generationConfig: {
-        temperature:     0.7,
-        maxOutputTokens: 600,
-      }
-    })
+      model:       GROQ_MODEL,
+      max_tokens:  600,
+      temperature: 0.7,
+      messages,
+    }),
   });
 
   if (!response.ok) {
     const err = await response.text();
-    throw new Error(`Gemini API error: ${response.status} — ${err}`);
+    throw new Error(`Groq API error: ${response.status} — ${err}`);
   }
 
   const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return data.choices?.[0]?.message?.content || '';
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -131,8 +125,9 @@ async function askGeminiWithHistory(systemPrompt, history, newMessage) {
 app.get('/health-check', (_req, res) => {
   res.json({
     status:    'ok',
-    ai:        'Google Gemini 1.5 Flash',
-    timestamp: new Date().toISOString()
+    ai:        'Groq — Llama 3 70B',
+    timestamp: new Date().toISOString(),
+    apiKey:    GROQ_API_KEY ? '✓ Set' : '✗ Missing',
   });
 });
 
@@ -171,7 +166,7 @@ Today: ${new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric
 
 Start from 8:00 AM. Prioritise high-priority tasks in the morning. Include short breaks.`;
 
-    const plan = await askGemini(system, prompt);
+    const plan = await askGroq(system, prompt);
     res.json({ plan });
 
   } catch (err) {
@@ -199,7 +194,7 @@ Subject: ${subject || 'suggest an appropriate subject'}
 Key points: ${points}
 Tone: ${tone}`;
 
-    const draft = await askGemini(system, prompt);
+    const draft = await askGroq(system, prompt);
     res.json({ draft });
 
   } catch (err) {
@@ -240,7 +235,7 @@ ${breakdown}
 
 Give: 1) brief assessment 2) biggest spending area insight 3) two practical saving tips.`;
 
-    const summary = await askGemini(system, prompt);
+    const summary = await askGroq(system, prompt);
     res.json({ summary, total: total.toFixed(2), byCategory });
 
   } catch (err) {
@@ -262,9 +257,8 @@ You help with: day planning, tasks, emails, finances, health, and appointments.
 Be friendly, concise, and proactive. Use light emojis occasionally.
 Keep responses under 180 words unless more detail is asked for.`;
 
-    const reply = await askGeminiWithHistory(system, history, message);
+    const reply = await askGroqWithHistory(system, history, message);
 
-    // Store session
     if (!db.chatSessions[sessionId]) db.chatSessions[sessionId] = [];
     db.chatSessions[sessionId].push(
       { role: 'user',      content: message },
@@ -290,7 +284,10 @@ app.post('/appointments', async (req, res) => {
     const { title, datetime, location = '', notes = '' } = req.body;
     if (!title || !datetime) return res.status(400).json({ error: 'title and datetime required' });
 
-    const appointment = { id: Date.now(), title, datetime, location, notes, createdAt: new Date().toISOString() };
+    const appointment = {
+      id: Date.now(), title, datetime, location, notes,
+      createdAt: new Date().toISOString(),
+    };
     db.appointments.push(appointment);
     res.json({ success: true, appointment });
 
@@ -318,6 +315,6 @@ app.use((err, _req, res, _next) => {
 // ─────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🟢 LifeAI Backend running on port ${PORT}`);
-  console.log(`   AI: Google Gemini 1.5 Flash`);
-  console.log(`   Gemini API key: ${GEMINI_API_KEY ? '✓ Set' : '✗ NOT SET — add GEMINI_API_KEY env var!'}`);
+  console.log(`   AI: Groq — Llama 3 70B (Free)`);
+  console.log(`   Groq API key: ${GROQ_API_KEY ? '✓ Set' : '✗ NOT SET — add GROQ_API_KEY env var!'}`);
 });
