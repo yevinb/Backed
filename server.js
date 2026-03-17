@@ -24,7 +24,8 @@ const PORT = process.env.PORT || 3001;
 // ─────────────────────────────────────────
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_URL     = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL   = 'llama3-70b-8192'; // fast, free, very capable
+// FIXED: Updated to currently supported model (was 'llama3-70b-8192' which is deprecated)
+const GROQ_MODEL   = 'llama-3.3-70b-versatile'; // Latest Llama 3.3 70B model
 
 // ─────────────────────────────────────────
 //  IN-MEMORY DATABASE
@@ -57,66 +58,76 @@ app.use((req, _res, next) => {
 //  Groq uses the OpenAI-compatible format
 // ─────────────────────────────────────────
 async function askGroq(systemPrompt, userMessage) {
-  const response = await fetch(GROQ_URL, {
-    method:  'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model:       GROQ_MODEL,
-      max_tokens:  800,
-      temperature: 0.7,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user',   content: userMessage  },
-      ],
-    }),
-  });
+  try {
+    const response = await fetch(GROQ_URL, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model:       GROQ_MODEL,
+        max_tokens:  800,
+        temperature: 0.7,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user',   content: userMessage  },
+        ],
+      }),
+    });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Groq API error: ${response.status} — ${err}`);
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`Groq API error: ${response.status} — ${err}`);
+    }
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || '';
+  } catch (error) {
+    console.error('askGroq error:', error);
+    throw error;
   }
-
-  const data = await response.json();
-  return data.choices?.[0]?.message?.content || '';
 }
 
 // ─────────────────────────────────────────
 //  HELPER — call Groq with chat history
 // ─────────────────────────────────────────
 async function askGroqWithHistory(systemPrompt, history, newMessage) {
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...history.map(h => ({
-      role:    h.role === 'assistant' ? 'assistant' : 'user',
-      content: h.content,
-    })),
-    { role: 'user', content: newMessage },
-  ];
+  try {
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...history.map(h => ({
+        role:    h.role === 'assistant' ? 'assistant' : 'user',
+        content: h.content,
+      })),
+      { role: 'user', content: newMessage },
+    ];
 
-  const response = await fetch(GROQ_URL, {
-    method:  'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model:       GROQ_MODEL,
-      max_tokens:  600,
-      temperature: 0.7,
-      messages,
-    }),
-  });
+    const response = await fetch(GROQ_URL, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model:       GROQ_MODEL,
+        max_tokens:  600,
+        temperature: 0.7,
+        messages,
+      }),
+    });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Groq API error: ${response.status} — ${err}`);
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`Groq API error: ${response.status} — ${err}`);
+    }
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || '';
+  } catch (error) {
+    console.error('askGroqWithHistory error:', error);
+    throw error;
   }
-
-  const data = await response.json();
-  return data.choices?.[0]?.message?.content || '';
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -125,7 +136,7 @@ async function askGroqWithHistory(systemPrompt, history, newMessage) {
 app.get('/health-check', (_req, res) => {
   res.json({
     status:    'ok',
-    ai:        'Groq — Llama 3 70B',
+    ai:        `Groq — ${GROQ_MODEL}`,
     timestamp: new Date().toISOString(),
     apiKey:    GROQ_API_KEY ? '✓ Set' : '✗ Missing',
   });
@@ -315,6 +326,6 @@ app.use((err, _req, res, _next) => {
 // ─────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🟢 LifeAI Backend running on port ${PORT}`);
-  console.log(`   AI: Groq — Llama 3 70B (Free)`);
+  console.log(`   AI: Groq — ${GROQ_MODEL} (Free)`);
   console.log(`   Groq API key: ${GROQ_API_KEY ? '✓ Set' : '✗ NOT SET — add GROQ_API_KEY env var!'}`);
 });
