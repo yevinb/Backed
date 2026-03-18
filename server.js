@@ -137,7 +137,7 @@ async function checkUsage(req, res, next, feature) {
       return res.status(403).json({ 
         error: 'limit_reached',
         message: 'You\'ve used all 5 free chat messages today. Upgrade to Pro for unlimited chats!',
-        upgradeUrl: '/pricing.html'
+        upgradeUrl: '/home.html'
       });
     }
     
