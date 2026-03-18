@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-//  LifeAI Backend — Node.js + Express + Groq + Gmail API
+//  LifeAI Backend — Node.js + Express + Groq + Google Fit
 // ═══════════════════════════════════════════════════════════════
 
 const express  = require('express');
@@ -12,11 +12,10 @@ const PORT = process.env.PORT || 3001;
 // ─────────────────────────────────────────
 //  CONFIG
 // ─────────────────────────────────────────
-const GROQ_API_KEY       = process.env.GROQ_API_KEY;
-const GMAIL_CLIENT_ID    = process.env.GMAIL_CLIENT_ID;
-const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
-const REDIRECT_URI       = 'https://backed-1-837p.onrender.com/auth/gmail/callback';
-const FIT_REDIRECT_URI   = 'https://backed-1-837p.onrender.com/auth/fit/callback';
+const GROQ_API_KEY        = process.env.GROQ_API_KEY;
+const GOOGLE_CLIENT_ID    = process.env.GMAIL_CLIENT_ID;    // reusing same OAuth credentials
+const GOOGLE_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
+const FIT_REDIRECT_URI    = 'https://backed-1-837p.onrender.com/auth/fit/callback';
 
 const GROQ_URL   = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
@@ -29,8 +28,7 @@ const db = {
   expenses:     [],
   tasks:        [],
   chatSessions: {},
-  gmailTokens:  {},
-  fitTokens:    {}, // uid → { access_token, refresh_token }
+  fitTokens:    {},
 };
 
 // ─────────────────────────────────────────
@@ -50,13 +48,13 @@ app.use((req, _res, next) => {
 });
 
 // ─────────────────────────────────────────
-//  GMAIL OAUTH HELPER
+//  OAUTH HELPER (Google Fit)
 // ─────────────────────────────────────────
 function getOAuthClient() {
   return new google.auth.OAuth2(
-    GMAIL_CLIENT_ID,
-    GMAIL_CLIENT_SECRET,
-    REDIRECT_URI
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    FIT_REDIRECT_URI
   );
 }
 
@@ -112,176 +110,6 @@ async function askGroqWithHistory(systemPrompt, history, newMessage) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  GMAIL AUTH ROUTES
-// ═══════════════════════════════════════════════════════════════
-
-// Step 1: Frontend calls this to get the Google auth URL
-app.get('/auth/gmail', (req, res) => {
-  const { uid } = req.query;
-  if (!uid) return res.status(400).json({ error: 'uid required' });
-
-  const oauth2Client = getOAuthClient();
-  const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    scope: [
-      'https://www.googleapis.com/auth/gmail.readonly',
-      'https://www.googleapis.com/auth/gmail.send',
-      'https://www.googleapis.com/auth/gmail.modify',
-    ],
-    state: uid, // pass uid through so we know who connected
-    prompt: 'consent',
-  });
-
-  res.json({ url });
-});
-
-// Step 2: Google redirects here after user approves
-app.get('/auth/gmail/callback', async (req, res) => {
-  const { code, state: uid } = req.query;
-  if (!code || !uid) return res.status(400).send('Missing code or uid');
-
-  try {
-    const oauth2Client = getOAuthClient();
-    const { tokens } = await oauth2Client.getToken(code);
-    db.gmailTokens[uid] = tokens;
-    console.log(`Gmail connected for uid: ${uid}`);
-    // Redirect back to dashboard with success
-    res.send(`
-      <html><body>
-        <script>
-          window.opener && window.opener.postMessage('gmail-connected', '*');
-          window.close();
-        </script>
-        <p>Gmail connected! You can close this window.</p>
-      </body></html>
-    `);
-  } catch (err) {
-    console.error('[/auth/gmail/callback]', err.message);
-    res.status(500).send('Authentication failed: ' + err.message);
-  }
-});
-
-// Check if Gmail is connected for a user
-app.get('/auth/gmail/status', (req, res) => {
-  const { uid } = req.query;
-  res.json({ connected: !!(uid && db.gmailTokens[uid]) });
-});
-
-// ═══════════════════════════════════════════════════════════════
-//  GMAIL API ROUTES
-// ═══════════════════════════════════════════════════════════════
-
-// GET /gmail/inbox?uid=xxx — fetch latest emails
-app.get('/gmail/inbox', async (req, res) => {
-  const { uid } = req.query;
-  if (!uid || !db.gmailTokens[uid]) {
-    return res.status(401).json({ error: 'Gmail not connected' });
-  }
-
-  try {
-    const oauth2Client = getOAuthClient();
-    oauth2Client.setCredentials(db.gmailTokens[uid]);
-
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    // Get list of latest 20 inbox messages
-    const list = await gmail.users.messages.list({
-      userId: 'me',
-      maxResults: 20,
-      labelIds: ['INBOX'],
-    });
-
-    if (!list.data.messages) return res.json({ emails: [] });
-
-    // Fetch details for each message
-    const emails = await Promise.all(
-      list.data.messages.map(async (msg) => {
-        const full = await gmail.users.messages.get({
-          userId: 'me',
-          id: msg.id,
-          format: 'metadata',
-          metadataHeaders: ['From', 'Subject', 'Date'],
-        });
-
-        const headers = full.data.payload.headers;
-        const getHeader = (name) => headers.find(h => h.name === name)?.value || '';
-
-        return {
-          id:      msg.id,
-          from:    getHeader('From'),
-          subject: getHeader('Subject'),
-          date:    getHeader('Date'),
-          snippet: full.data.snippet,
-          unread:  full.data.labelIds?.includes('UNREAD') || false,
-        };
-      })
-    );
-
-    // Update tokens if refreshed
-    db.gmailTokens[uid] = oauth2Client.credentials;
-
-    res.json({ emails });
-  } catch (err) {
-    console.error('[/gmail/inbox]', err.message);
-    res.status(500).json({ error: 'Failed to fetch emails', details: err.message });
-  }
-});
-
-// POST /gmail/send — send an email
-app.post('/gmail/send', async (req, res) => {
-  const { uid, to, subject, body } = req.body;
-  if (!uid || !db.gmailTokens[uid]) {
-    return res.status(401).json({ error: 'Gmail not connected' });
-  }
-  if (!to || !subject || !body) {
-    return res.status(400).json({ error: 'to, subject and body are required' });
-  }
-
-  try {
-    const oauth2Client = getOAuthClient();
-    oauth2Client.setCredentials(db.gmailTokens[uid]);
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    // Encode email in base64
-    const raw = Buffer.from(
-      `To: ${to}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`
-    ).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-
-    await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
-
-    db.gmailTokens[uid] = oauth2Client.credentials;
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[/gmail/send]', err.message);
-    res.status(500).json({ error: 'Failed to send email', details: err.message });
-  }
-});
-
-// POST /gmail/mark-read — mark email as read
-app.post('/gmail/mark-read', async (req, res) => {
-  const { uid, messageId } = req.body;
-  if (!uid || !db.gmailTokens[uid]) return res.status(401).json({ error: 'Gmail not connected' });
-
-  try {
-    const oauth2Client = getOAuthClient();
-    oauth2Client.setCredentials(db.gmailTokens[uid]);
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    await gmail.users.messages.modify({
-      userId: 'me',
-      id: messageId,
-      requestBody: { removeLabelIds: ['UNREAD'] },
-    });
-
-    db.gmailTokens[uid] = oauth2Client.credentials;
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[/gmail/mark-read]', err.message);
-    res.status(500).json({ error: 'Failed to mark as read' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════
 //  GOOGLE FIT ROUTES
 // ═══════════════════════════════════════════════════════════════
 
@@ -290,7 +118,7 @@ app.get('/auth/fit', (req, res) => {
   if (!uid) return res.status(400).json({ error: 'uid required' });
 
   const oauth2Client = new google.auth.OAuth2(
-    GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, FIT_REDIRECT_URI
+    GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, FIT_REDIRECT_URI
   );
 
   const url = oauth2Client.generateAuthUrl({
@@ -312,7 +140,7 @@ app.get('/auth/fit/callback', async (req, res) => {
 
   try {
     const oauth2Client = new google.auth.OAuth2(
-      GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, FIT_REDIRECT_URI
+      GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, FIT_REDIRECT_URI
     );
     const { tokens } = await oauth2Client.getToken(code);
     db.fitTokens[uid] = tokens;
@@ -346,7 +174,7 @@ app.get('/fit/steps', async (req, res) => {
 
   try {
     const oauth2Client = new google.auth.OAuth2(
-      GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, FIT_REDIRECT_URI
+      GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, FIT_REDIRECT_URI
     );
     oauth2Client.setCredentials(db.fitTokens[uid]);
 
@@ -397,7 +225,7 @@ app.get('/health-check', (_req, res) => {
     ai:        `Groq — ${GROQ_MODEL}`,
     timestamp: new Date().toISOString(),
     apiKey:    GROQ_API_KEY ? '✓ Set' : '✗ Missing',
-    gmail:     GMAIL_CLIENT_ID ? '✓ Configured' : '✗ Missing',
+    googleFit: GOOGLE_CLIENT_ID ? '✓ Configured' : '✗ Missing',
   });
 });
 
@@ -547,5 +375,5 @@ app.listen(PORT, () => {
   console.log(`\n🟢 LifeAI Backend running on port ${PORT}`);
   console.log(`   AI: Groq — ${GROQ_MODEL} (Free)`);
   console.log(`   Groq API key: ${GROQ_API_KEY ? '✓ Set' : '✗ NOT SET'}`);
-  console.log(`   Gmail: ${GMAIL_CLIENT_ID ? '✓ Configured' : '✗ NOT SET'}`);
+  console.log(`   Google Fit: ${GOOGLE_CLIENT_ID ? '✓ Configured' : '✗ NOT SET'}`);
 });
