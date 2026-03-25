@@ -1,57 +1,38 @@
 // ═══════════════════════════════════════════════════════════════
-//  LifeAI Backend — Node.js + Express + Groq + Firebase + PayPal
+//  LifeAI Backend — Node.js + Express + Groq API + Push Notifications
 // ═══════════════════════════════════════════════════════════════
 
-const express = require('express');
-const cors = require('cors');
-const admin = require('firebase-admin');
-const fetch = require('node-fetch');
+const express   = require('express');
+const cors      = require('cors');
+const webpush   = require('web-push');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3001;
 
 // ─────────────────────────────────────────
 //  CONFIG
 // ─────────────────────────────────────────
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || 'BOicrh8l9bmKZdvdc5JFCZ57Kk6K5T_l5zrbhQlWQk33atUkMRr9wrCbLUvN0kqSojgyckzcedcIrVpIObgp_bo';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || 'SlgdoZxoBkDPKAiaXBu_cmCS9AJY1yfFlP17Us_b_5I';
+
+webpush.setVapidDetails(
+  'mailto:admin@smartlifeai.co.uk',
+  VAPID_PUBLIC_KEY,
+  VAPID_PRIVATE_KEY
+);
+
+const GROQ_URL   = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
-// PayPal Configuration
-const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
-const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
-const PAYPAL_API = process.env.NODE_ENV === 'production' 
-  ? 'https://api-m.paypal.com' 
-  : 'https://api-m.sandbox.paypal.com';
-
 // ─────────────────────────────────────────
-//  FIREBASE INITIALIZATION
+//  IN-MEMORY STORE
 // ─────────────────────────────────────────
-const serviceAccount = {
-  type: "service_account",
-  project_id: "ai-life-assistant-c9b14",
-  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-  private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-  client_email: process.env.FIREBASE_CLIENT_EMAIL,
-  client_id: process.env.FIREBASE_CLIENT_ID,
-  auth_uri: "https://accounts.google.com/o/oauth2/auth",
-  token_uri: "https://oauth2.googleapis.com/token"
-};
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: `https://${serviceAccount.project_id}.firebaseio.com`
-});
-
-const db = admin.firestore();
-
-// ─────────────────────────────────────────
-//  IN-MEMORY STORE (for development)
-// ─────────────────────────────────────────
-const memoryDb = {
+const db = {
   appointments: [],
-  expenses: [],
-  tasks: [],
+  expenses:     [],
+  tasks:        [],
   chatSessions: {},
 };
 
@@ -72,100 +53,23 @@ app.use((req, _res, next) => {
 });
 
 // ─────────────────────────────────────────
-//  AUTHENTICATION MIDDLEWARE
-// ─────────────────────────────────────────
-async function authenticateToken(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
-
-  try {
-    const decodedToken = await admin.auth().verifyIdToken(token);
-    req.user = decodedToken;
-    next();
-  } catch (error) {
-    console.error('Token verification error:', error);
-    res.status(403).json({ error: 'Invalid token' });
-  }
-}
-
-// ─────────────────────────────────────────
-//  USAGE CHECK MIDDLEWARE
-// ─────────────────────────────────────────
-async function checkUsage(req, res, next, feature) {
-  try {
-    const userDoc = await db.collection('users').doc(req.user.uid).get();
-    
-    if (!userDoc.exists) {
-      // Create default free user
-      await db.collection('users').doc(req.user.uid).set({
-        email: req.user.email,
-        displayName: req.user.name || '',
-        plan: 'free',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        usage: {
-          tasks: 0,
-          chatMessages: 0,
-          appointments: 0,
-          lastReset: new Date().toISOString().split('T')[0]
-        }
-      });
-      return next();
-    }
-    
-    const userData = userDoc.data();
-    
-    // Pro users have no limits
-    if (userData.plan === 'pro') {
-      return next();
-    }
-    
-    // Check daily reset for chat
-    const today = new Date().toISOString().split('T')[0];
-    if (userData.usage?.lastReset !== today) {
-      await db.collection('users').doc(req.user.uid).update({
-        'usage.chatMessages': 0,
-        'usage.lastReset': today
-      });
-    }
-    
-    // Check limits
-    if (feature === 'chat' && userData.usage?.chatMessages >= 5) {
-      return res.status(403).json({ 
-        error: 'limit_reached',
-        message: 'You\'ve used all 5 free chat messages today. Upgrade to Pro for unlimited chats!',
-        upgradeUrl: '/home.html'
-      });
-    }
-    
-    next();
-  } catch (err) {
-    console.error('Usage check error:', err);
-    next(); // Allow on error
-  }
-}
-
-// ─────────────────────────────────────────
 //  GROQ HELPERS
 // ─────────────────────────────────────────
 async function askGroq(systemPrompt, userMessage) {
   try {
     const response = await fetch(GROQ_URL, {
-      method: 'POST',
+      method:  'POST',
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type':  'application/json',
         'Authorization': `Bearer ${GROQ_API_KEY}`,
       },
       body: JSON.stringify({
-        model: GROQ_MODEL,
-        max_tokens: 800,
+        model:       GROQ_MODEL,
+        max_tokens:  800,
         temperature: 0.7,
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage },
+          { role: 'user',   content: userMessage  },
         ],
       }),
     });
@@ -186,7 +90,7 @@ async function askGroqWithHistory(systemPrompt, history, newMessage) {
       { role: 'user', content: newMessage },
     ];
     const response = await fetch(GROQ_URL, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
       body: JSON.stringify({ model: GROQ_MODEL, max_tokens: 600, temperature: 0.7, messages }),
     });
@@ -199,170 +103,19 @@ async function askGroqWithHistory(systemPrompt, history, newMessage) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  HEALTH CHECK
-// ═══════════════════════════════════════════════════════════════
 app.get('/health-check', (_req, res) => {
   res.json({
-    status: 'ok',
-    ai: `Groq — ${GROQ_MODEL}`,
+    status:    'ok',
+    ai:        `Groq — ${GROQ_MODEL}`,
     timestamp: new Date().toISOString(),
-    apiKey: GROQ_API_KEY ? '✓ Set' : '✗ Missing',
+    apiKey:    GROQ_API_KEY ? '✓ Set' : '✗ Missing',
+    googleFit: GOOGLE_CLIENT_ID ? '✓ Configured' : '✗ Missing',
   });
 });
 
-// ═══════════════════════════════════════════════════════════════
-//  SUBSCRIPTION ENDPOINTS
-// ═══════════════════════════════════════════════════════════════
-
-// Get subscription status
-app.get('/api/subscription/status', authenticateToken, async (req, res) => {
-  try {
-    const userDoc = await db.collection('users').doc(req.user.uid).get();
-    
-    if (!userDoc.exists) {
-      await db.collection('users').doc(req.user.uid).set({
-        email: req.user.email,
-        displayName: req.user.name || '',
-        plan: 'free',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        usage: {
-          tasks: 0,
-          chatMessages: 0,
-          appointments: 0,
-          lastReset: new Date().toISOString().split('T')[0]
-        }
-      });
-      return res.json({ plan: 'free', usage: { tasks: 0, chatMessages: 0, appointments: 0 } });
-    }
-    
-    const userData = userDoc.data();
-    res.json({
-      plan: userData.plan || 'free',
-      usage: userData.usage || {},
-      subscription: userData.subscription || null
-    });
-  } catch (err) {
-    console.error('Subscription status error:', err);
-    res.status(500).json({ error: 'Failed to get subscription status' });
-  }
-});
-
-// Create PayPal order
-app.post('/api/create-paypal-order', authenticateToken, async (req, res) => {
-  try {
-    const { plan, amount, userId, email } = req.body;
-    
-    const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
-    
-    const response = await fetch(`${PAYPAL_API}/v2/checkout/orders`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Basic ${auth}`
-      },
-      body: JSON.stringify({
-        intent: 'CAPTURE',
-        purchase_units: [{
-          reference_id: `${userId}_${plan}`,
-          description: `LifeAI Pro ${plan.includes('yearly') ? 'Yearly' : 'Monthly'} Subscription`,
-          amount: {
-            currency_code: 'GBP',
-            value: amount
-          }
-        }],
-        application_context: {
-          brand_name: 'LifeAI',
-          landing_page: 'BILLING',
-          user_action: 'PAY_NOW',
-          return_url: 'https://lifeai-home.onrender.com/pricing.html',
-          cancel_url: 'https://lifeai-home.onrender.com/pricing.html'
-        }
-      })
-    });
-    
-    const order = await response.json();
-    res.json({ id: order.id });
-  } catch (err) {
-    console.error('Create PayPal order error:', err);
-    res.status(500).json({ error: 'Failed to create order' });
-  }
-});
-
-// Capture PayPal order
-app.post('/api/capture-paypal-order', authenticateToken, async (req, res) => {
-  try {
-    const { orderId, userId } = req.body;
-    
-    const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
-    
-    const response = await fetch(`${PAYPAL_API}/v2/checkout/orders/${orderId}/capture`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Basic ${auth}`
-      }
-    });
-    
-    const capture = await response.json();
-    
-    if (capture.status === 'COMPLETED') {
-      const amount = capture.purchase_units[0].payments.captures[0].amount.value;
-      const plan = amount === '67.00' ? 'pro_yearly' : 'pro_monthly';
-      
-      await db.collection('users').doc(userId).update({
-        plan: 'pro',
-        subscription: {
-          plan: plan,
-          status: 'active',
-          orderId: orderId,
-          amount: amount,
-          currency: 'GBP',
-          startDate: admin.firestore.FieldValue.serverTimestamp(),
-          endDate: plan === 'pro_yearly' 
-            ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) 
-            : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-          paymentId: capture.purchase_units[0].payments.captures[0].id
-        },
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      
-      await db.collection('transactions').add({
-        userId,
-        orderId,
-        amount,
-        plan,
-        status: 'completed',
-        timestamp: admin.firestore.FieldValue.serverTimestamp()
-      });
-    }
-    
-    res.json(capture);
-  } catch (err) {
-    console.error('Capture PayPal order error:', err);
-    res.status(500).json({ error: 'Failed to capture order' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════
-//  API ENDPOINTS (with usage tracking)
-// ═══════════════════════════════════════════════════════════════
-
-app.post('/plan-day', authenticateToken, async (req, res) => {
+app.post('/plan-day', async (req, res) => {
   try {
     const { tasks = [], appointments = [] } = req.body;
-    
-    // Check task limit for free users
-    const userDoc = await db.collection('users').doc(req.user.uid).get();
-    const userData = userDoc.data();
-    
-    if (userData.plan !== 'pro' && tasks.length > 10) {
-      return res.status(403).json({ 
-        error: 'limit_reached',
-        message: 'Free tier limit: maximum 10 tasks. Upgrade to Pro for unlimited tasks!'
-      });
-    }
-    
     const taskList = tasks.length
       ? tasks.map(t => `  • [${t.priority.toUpperCase()}] ${t.name}`).join('\n')
       : '  • No pending tasks';
@@ -391,7 +144,7 @@ Start from 8:00 AM. Prioritise high-priority tasks in the morning. Include short
   }
 });
 
-app.post('/draft-email', authenticateToken, async (req, res) => {
+app.post('/draft-email', async (req, res) => {
   try {
     const { to = '', subject = '', points, tone = 'professional' } = req.body;
     if (!points) return res.status(400).json({ error: 'Key points are required' });
@@ -414,7 +167,7 @@ Tone: ${tone}`;
   }
 });
 
-app.post('/finance-summary', authenticateToken, async (req, res) => {
+app.post('/finance-summary', async (req, res) => {
   try {
     const { expenses = [] } = req.body;
     if (!expenses.length) return res.status(400).json({ error: 'No expense data' });
@@ -445,31 +198,8 @@ Give: 1) brief assessment 2) biggest spending area insight 3) two practical savi
   }
 });
 
-app.post('/chat', authenticateToken, async (req, res) => {
+app.post('/chat', async (req, res) => {
   try {
-    // Check and update usage
-    const userDoc = await db.collection('users').doc(req.user.uid).get();
-    const userData = userDoc.data();
-    
-    if (userData.plan !== 'pro') {
-      const today = new Date().toISOString().split('T')[0];
-      if (userData.usage?.lastReset !== today) {
-        await db.collection('users').doc(req.user.uid).update({
-          'usage.chatMessages': 1,
-          'usage.lastReset': today
-        });
-      } else if (userData.usage?.chatMessages >= 5) {
-        return res.status(403).json({ 
-          error: 'limit_reached',
-          message: 'Daily chat limit reached. Upgrade to Pro for unlimited chats!'
-        });
-      } else {
-        await db.collection('users').doc(req.user.uid).update({
-          'usage.chatMessages': admin.firestore.FieldValue.increment(1)
-        });
-      }
-    }
-    
     const { message, history = [], sessionId = 'default' } = req.body;
     if (!message) return res.status(400).json({ error: 'Message is required' });
 
@@ -480,13 +210,13 @@ Keep responses under 180 words unless more detail is asked for.`;
 
     const reply = await askGroqWithHistory(system, history, message);
 
-    if (!memoryDb.chatSessions[sessionId]) memoryDb.chatSessions[sessionId] = [];
-    memoryDb.chatSessions[sessionId].push(
-      { role: 'user', content: message },
-      { role: 'assistant', content: reply }
+    if (!db.chatSessions[sessionId]) db.chatSessions[sessionId] = [];
+    db.chatSessions[sessionId].push(
+      { role: 'user',      content: message },
+      { role: 'assistant', content: reply   }
     );
-    if (memoryDb.chatSessions[sessionId].length > 40) {
-      memoryDb.chatSessions[sessionId] = memoryDb.chatSessions[sessionId].slice(-40);
+    if (db.chatSessions[sessionId].length > 40) {
+      db.chatSessions[sessionId] = db.chatSessions[sessionId].slice(-40);
     }
 
     res.json({ reply });
@@ -496,35 +226,12 @@ Keep responses under 180 words unless more detail is asked for.`;
   }
 });
 
-app.post('/appointments', authenticateToken, async (req, res) => {
+app.post('/appointments', async (req, res) => {
   try {
     const { title, datetime, location = '', notes = '' } = req.body;
     if (!title || !datetime) return res.status(400).json({ error: 'title and datetime required' });
-    
-    // Check appointment limit for free users
-    const userDoc = await db.collection('users').doc(req.user.uid).get();
-    const userData = userDoc.data();
-    
-    if (userData.plan !== 'pro') {
-      const userAppointments = memoryDb.appointments.filter(a => a.userId === req.user.uid);
-      if (userAppointments.length >= 3) {
-        return res.status(403).json({ 
-          error: 'limit_reached',
-          message: 'Free tier limit: maximum 3 appointments. Upgrade to Pro for unlimited appointments!'
-        });
-      }
-    }
-    
-    const appointment = { 
-      id: Date.now(), 
-      userId: req.user.uid,
-      title, 
-      datetime, 
-      location, 
-      notes, 
-      createdAt: new Date().toISOString() 
-    };
-    memoryDb.appointments.push(appointment);
+    const appointment = { id: Date.now(), title, datetime, location, notes, createdAt: new Date().toISOString() };
+    db.appointments.push(appointment);
     res.json({ success: true, appointment });
   } catch (err) {
     console.error('[/appointments]', err.message);
@@ -532,9 +239,25 @@ app.post('/appointments', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/appointments', authenticateToken, (req, res) => {
-  const userAppointments = memoryDb.appointments.filter(a => a.userId === req.user.uid);
-  res.json({ appointments: userAppointments });
+app.get('/appointments', (_req, res) => {
+  res.json({ appointments: db.appointments });
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  POST /push/send — send a push notification
+// ═══════════════════════════════════════════════════════════════
+app.post('/push/send', async (req, res) => {
+  try {
+    const { subscription, title, body, url } = req.body;
+    if (!subscription) return res.status(400).json({ error: 'subscription required' });
+
+    const payload = JSON.stringify({ title, body, url: url || '/dashboard.html' });
+    await webpush.sendNotification(JSON.parse(subscription), payload);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[/push/send]', err.message);
+    res.status(500).json({ error: 'Failed to send notification', details: err.message });
+  }
 });
 
 // ─────────────────────────────────────────
@@ -551,8 +274,7 @@ app.use((err, _req, res, _next) => {
 // ─────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🟢 LifeAI Backend running on port ${PORT}`);
-  console.log(`   AI: Groq — ${GROQ_MODEL}`);
-  console.log(`   Firebase: ✓ Connected`);
-  console.log(`   PayPal: ${PAYPAL_CLIENT_ID ? '✓ Configured' : '✗ Missing'}`);
+  console.log(`   AI: Groq — ${GROQ_MODEL} (Free)`);
   console.log(`   Groq API key: ${GROQ_API_KEY ? '✓ Set' : '✗ NOT SET'}`);
+  console.log(`   Google Fit: ${GOOGLE_CLIENT_ID ? '✓ Configured' : '✗ NOT SET'}`);
 });
