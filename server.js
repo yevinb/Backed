@@ -230,10 +230,10 @@ app.post('/chat', async (req, res) => {
     const { message, history = [], sessionId = 'default' } = req.body;
     if (!message) return res.status(400).json({ error: 'Message is required' });
 
-    const system = `You are LifeAI — a warm, knowledgeable personal life assistant.
-You help with: day planning, tasks, emails, finances, health, and appointments.
-Be friendly, concise, and proactive. Use light emojis occasionally.
-Keep responses under 180 words unless more detail is asked for.`;
+    const system = `You are LifeAI — the intelligent personal command centre at smartlifeai.co.uk.
+You help users in the UK with: day planning, tasks, emails, finances (including subscriptions), health, and appointments.
+Be warm, concise, and actionable. Use £ for money. Light emojis only when natural.
+Never make up numbers — if data is in the user's message, use it. Keep responses under 180 words unless asked for more.`;
 
     const reply = await askGroqWithHistory(system, history, message);
 
