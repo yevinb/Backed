@@ -169,8 +169,10 @@ Tone: ${tone}`;
 
 app.post('/finance-summary', async (req, res) => {
   try {
-    const { expenses = [] } = req.body;
-    if (!expenses.length) return res.status(400).json({ error: 'No expense data' });
+    const { expenses = [], subscriptions = [], profile = {} } = req.body;
+    if (!expenses.length && !subscriptions.length) {
+      return res.status(400).json({ error: 'No expense or subscription data' });
+    }
 
     const total = expenses.reduce((s, e) => s + parseFloat(e.amount || e.amt || 0), 0);
     const byCategory = expenses.reduce((acc, e) => {
@@ -179,19 +181,44 @@ app.post('/finance-summary', async (req, res) => {
       return acc;
     }, {});
 
+    const subBurn = subscriptions
+      .filter(s => s.status !== 'cancelled')
+      .reduce((sum, s) => sum + (s.cycle === 'yearly' ? s.amount / 12 : s.amount), 0);
+    const unusedSave = subscriptions
+      .filter(s => s.status === 'unused')
+      .reduce((sum, s) => sum + (s.cycle === 'yearly' ? s.amount / 12 : s.amount), 0);
+
     const breakdown = Object.entries(byCategory)
       .sort((a, b) => b[1] - a[1])
       .map(([cat, amt]) => `  • ${cat}: £${amt.toFixed(2)}`)
       .join('\n');
 
-    const system = `You are a friendly financial advisor. Analyse expenses and give actionable insights.
-Be encouraging, not judgmental. Use £ for currency. Max 200 words. Use emojis sparingly.`;
+    const subList = subscriptions.length
+      ? subscriptions.map(s => `  • ${s.name}: £${s.amount}/${s.cycle} (${s.status})`).join('\n')
+      : '  • None tracked';
 
-    const prompt = `Analyse my spending:\nTotal: £${total.toFixed(2)}\nBy category:\n${breakdown}
-Give: 1) brief assessment 2) biggest spending area insight 3) two practical saving tips.`;
+    const income = profile.monthlyIncome || 0;
+    const savingsRate = income ? Math.max(0, Math.round(((income - total - subBurn) / income) * 100)) : null;
+
+    const system = `You are a friendly financial advisor for LifeAI users in the UK.
+Analyse expenses AND subscriptions. Be encouraging, not judgmental. Use £ for currency. Max 220 words. Use emojis sparingly.
+Highlight subscription waste if unused services exist. Suggest concrete next steps.`;
+
+    const prompt = `Analyse my finances:
+Monthly income: ${income ? '£' + income.toFixed(2) : 'not set'}
+Expense total tracked: £${total.toFixed(2)}
+${breakdown ? 'By category:\n' + breakdown : ''}
+
+Subscription burn: £${subBurn.toFixed(2)}/mo (£${(subBurn * 12).toFixed(2)}/yr)
+Potential savings from unused subs: £${unusedSave.toFixed(2)}/mo
+Subscriptions:
+${subList}
+${savingsRate !== null ? 'Estimated savings rate: ' + savingsRate + '%' : ''}
+
+Give: 1) brief assessment 2) subscription insight 3) two practical saving tips.`;
 
     const summary = await askGroq(system, prompt);
-    res.json({ summary, total: total.toFixed(2), byCategory });
+    res.json({ summary, total: total.toFixed(2), byCategory, subBurn: subBurn.toFixed(2), unusedSave: unusedSave.toFixed(2) });
   } catch (err) {
     console.error('[/finance-summary]', err.message);
     res.status(500).json({ error: 'Failed to generate summary', details: err.message });
